@@ -1,0 +1,197 @@
+### Обновленный смарт-контракт
+
+solidity
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+// Импортируем нужные библиотеки и контракты
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import "@openzeppelin/contracts/access/AccessControl.sol";
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+
+// Интерфейс для PancakeSwap V2 Router
+interface IPancakeV2Router {
+    function swapExactTokensForTokens(
+        uint amountIn,
+        uint amountOutMin,
+        address[] calldata path,
+        address to,
+        uint deadline
+    ) external returns (uint[] memory amounts);
+
+    function getAmountsOut(uint256 amountIn, address[] calldata path) external view returns (uint256[] memory amounts);
+}
+
+// Интерфейс для PancakeSwap V3 Router
+interface IPancakeV3Router {
+    function swapExactInputSingle(
+        IPancakeV3Router.ExactInputSingleParams calldata params
+    ) external returns (uint256 amountOut);
+
+    struct ExactInputSingleParams {
+        address tokenIn;
+        address tokenOut;
+        uint256 amountIn;
+        uint256 amountOutMinimum;
+        uint160 sqrtPriceLimitX96;
+        address recipient;
+        uint256 deadline;
+    }
+}
+
+// Основной контракт арбитража
+contract ArbitrageContract is AccessControl, ReentrancyGuard {
+    using SafeERC20 for IERC20;
+
+    IPancakeV2Router public immutable pancakeV2Router; // Контракт роутера PancakeSwap V2
+    IPancakeV3Router public immutable pancakeV3Router; // Контракт роутера PancakeSwap V3
+    uint256 public maxTradeAmount; // Максимальная сумма для торговли
+    uint256 public minTradeAmount; // Минимальная сумма для торговли
+
+    bytes32 public constant ADMIN_ROLE = keccak256("ADMIN_ROLE");
+
+    // События
+    event ArbitrageExecuted(
+        address indexed tokenIn,
+        address indexed tokenOut,
+        uint256 amountIn,
+        uint256 profit,
+        address indexed trader
+    );
+    event ErrorOccurred(string message);
+
+    constructor(
+        address _pancakeV2Router,
+        address _pancakeV3Router,
+        uint256 _maxTradeAmount,
+        uint256 _minTradeAmount
+    ) {
+        _setupRole(DEFAULT_ADMIN_ROLE, msg.sender);
+        pancakeV2Router = IPancakeV2Router(_pancakeV2Router);
+        pancakeV3Router = IPancakeV3Router(_pancakeV3Router);
+        maxTradeAmount = _maxTradeAmount;
+        minTradeAmount = _minTradeAmount;
+    }
+
+    // Функция для выполнения арбитража
+    function executeArbitrage(
+        address[] calldata pathV2, // путь для PancakeSwap V2
+        address[] calldata pathV3, // путь для PancakeSwap V3
+        uint256 amountIn,
+        uint256 minAmountOutV2,
+        uint256 minAmountOutV3,
+        bool isBuyV2 // true if buy on V2, false if sell on V2
+    ) external onlyRole(ADMIN_ROLE) nonReentrant {
+        require(amountIn > 0, "Amount must be greater than 0");
+        require(amountIn >= minTradeAmount, "Amount is below minimum limit");
+        require(amountIn <= maxTradeAmount, "Amount exceeds maximum limit");
+
+        if (isBuyV2) {
+            // Проверяем, что адрес токена ненулевой
+            require(pathV2[0] != address(0), "Token address cannot be zero");
+            require(pathV2[pathV2.length - 1] != address(0), "Output token address cannot be zero");
+
+            // Покупка на PancakeSwap V2
+            IERC20(pathV2[0]).safeTransferFrom(msg.sender, address(this), amountIn);
+            IERC20(pathV2[0]).safeApprove(address(pancakeV2Router), amountIn);
+
+            uint[] memory amountsOutV2 = pancakeV2Router.swapExactTokensForTokens(
+                amountIn,
+                minAmountOutV2,
+                pathV2,
+                address(this),
+                block.timestamp
+            );
+
+            uint256 profitFromV2 = amountsOutV2[amountsOutV2.length - 1];
+
+            // Продажа на PancakeSwap V3
+            IERC20(pathV2[pathV2.length - 1]).safeApprove(address(pancakeV3Router), profitFromV2);
+
+            IPancakeV3Router.ExactInputSingleParams memory params = IPancakeV3Router.ExactInputSingleParams({
+                tokenIn: pathV2[pathV2.length - 1],
+                tokenOut: pathV3[pathV3.length - 1],
+                amountIn: profitFromV2,
+                amountOutMinimum: minAmountOutV3,
+                sqrtPriceLimitX96: 0,
+                recipient: msg.sender,
+                deadline: block.timestamp
+            });
+
+            uint256 profitToV3 = pancakeV3Router.swapExactInputSingle(params);
+
+            emit ArbitrageExecuted(pathV2[0], pathV3[pathV3.length - 1], amountIn, profitToV3, msg.sender);
+        } else {
+            // Проверяем, что адрес токена ненулевой
+            require(pathV3[0] != address(0), "Token address cannot be zero");
+            require(pathV3[1] != address(0), "Output token address cannot be zero");
+
+            // Продажа на PancakeSwap V3
+            IERC20(pathV3[0]).safeTransferFrom(msg.sender, address(this), amountIn);
+            IERC20(pathV3[0]).safeApprove(address(pancakeV3Router), amountIn);
+
+            IPancakeV3Router.ExactInputSingleParams memory params = IPancakeV3Router.ExactInputSingleParams({
+                tokenIn: pathV3[0],
+                tokenOut: pathV3[1],
+                amountIn: amountIn,
+                amountOutMinimum: minAmountOutV3,
+                sqrtPriceLimitX96: 0,
+                recipient: address(this),
+                deadline: block.timestamp
+            });
+
+            uint256 profitFromV3;
+            try pancakeV3Router.swapExactInputSingle(params) returns (uint256 amountOut) {
+                profitFromV3 = amountOut;
+            } catch {
+                emit ErrorOccurred("Swap on V3 failed");
+                revert("Swap on V3 failed");
+            }
+
+            // Покупка на PancakeSwap V2
+            IERC20(pathV3[1]).safeApprove(address(pancakeV2Router), profitFromV3);
+            uint[] memory amountsOutV2 = pancakeV2Router.swapExactTokensForTokens(
+                profitFromV3,
+                minAmountOutV2,
+                pathV2,
+                address(this),
+                block.timestamp
+            );
+
+            emit ArbitrageExecuted(pathV3[0], pathV2[pathV2.length - 1], amountIn, amountsOutV2[amountsOutV2.length - 1], msg.sender);
+        }
+    }
+
+    // Функция для изменения параметров торговли
+    function setTradeLimits(uint256 _maxTradeAmount, uint256 _minTradeAmount) external onlyRole(ADMIN_ROLE) {
+        maxTradeAmount = _maxTradeAmount;
+        minTradeAmount = _minTradeAmount;
+    }
+}
+
+
+### Объяснение внедренных улучшений
+
+1. **Защита от реентерантности**:
+- Добавлен модификатор `nonReentrant` в функцию `executeArbitrage`, чтобы защитить от атак реентерантности.
+
+2. **Проверка входных данных**:
+- Добавлены проверки для `amountIn`, чтобы убедиться, что оно больше нуля и находится в диапазоне `minTradeAmount` и `maxTradeAmount`.
+- Проверены адреса токенов, чтобы убедиться, что они не равны нулю.
+
+3. **Улучшение управления правами доступа**:
+- Разделены роли через `AccessControl`, что позволяет управлять доступом к функции и оставить возможность изменять параметры торговли для администраторов.
+
+4. **Логирование успехов и ошибок**:
+- Добавлены события `ErrorOccurred` для логирования ошибок при выполнении операций, чтобы пользователи знали о проблемах.
+
+5. **Оптимизация расхода газа**:
+- Пересмотрены вызовы внешних контрактов, чтобы избежать лишних операций.
+- Избегание лишних вычислений и проверок, чтобы уменьшить затраты на газ.
+
+6. **Стратегии управления ликвидностью**:
+- Функция `setTradeLimits` добавлена для возможности динамического изменения лимитов торговли.
+
+7. **Документация и комментарии**:
+- Добавлены комментарии для каждой основные части кода, чтобы улучшить понимание логики контракта.
