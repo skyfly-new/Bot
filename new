@@ -1,0 +1,248 @@
+solidity
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+// Импорты нужных интерфейсов и библиотек
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import "@openzeppelin/contracts/access/AccessControl.sol";
+
+// Определение интерфейса для Uniswap Router (или PancakeSwap)
+interface IUniswapV2Router02 {
+    function swapExactTokensForTokens(
+        uint amountIn,
+        uint amountOutMin,
+        address[] calldata path,
+        address to,
+        uint deadline
+    ) external returns (uint[] memory amounts);
+
+    function getAmountsOut(uint256 amountIn, address[] calldata path) external view returns (uint256[] memory amounts);
+}
+
+// Расширенный интерфейс токена
+interface IERC20Extended is IERC20 {
+    function isFrozen(address account) external view returns (bool);
+}
+
+// Интерфейс для пула ликвидности
+interface ILiquidityPool {
+    function getReserves() external view returns (uint112 reserve0, uint112 reserve1);
+}
+
+// Основной контракт арбитража
+contract ArbitrageContract is AccessControl {
+    using SafeERC20 for IERC20Extended;
+
+    IUniswapV2Router02 public router; // Контракт роутера Uniswap (PancakeSwap)
+    uint256 public maxTradeAmount; // Максимальная сумма для торговли
+    uint256 public minTradeAmount; // Минимальная сумма для торговли
+    uint256 public gasLimit; // Лимит газа для выполнения операций
+    uint256 public lastAuditTime; // Время последнего аудита
+    bool public tradingPaused; // Статус торговли
+    bool public auditPassed; // Статус аудита
+
+    enum ReentrancyStatus { NotEntered, Entered }
+    ReentrancyStatus public reentrancyStatus; // Статус повторного входа
+
+    bool public emergencyPause; // Для аварийной остановки
+    uint256 public lastEmergencyPauseTime; // Время последней аварийной остановки
+
+    // Метаданные
+    string public contractVersion; // Хранит версию контракта
+    string public contractDescription; // Описание контракта
+
+    bytes32 public constant ADMIN_ROLE = keccak256("ADMIN_ROLE");
+
+    // События
+    event MetadataUpdated(string newVersion, string newDescription);
+    event EmergencyWithdrawal(address indexed token, uint256 amount, address indexed to);
+    event ArbitrageExecuted(address indexed tokenIn, address indexed tokenOut, uint256 amountIn, uint256 profit, address indexed trader);
+    event GasCostCalculated(uint256 gasUsed, uint256 gasCost);
+    event SecurityCheckPassed(bool status);
+    event AuditStatusUpdated(bool passed);
+    event RouterUpdated(address indexed newRouter);
+    event TradingStatusUpdated(bool paused);
+    event EmergencyPauseActivated();
+    event TradeLogged(address indexed tokenIn, address indexed tokenOut, uint256 amountIn, uint256 amountOut);
+    event Withdrawal(address indexed token, uint256 amount, address indexed to);
+
+    // Модификаторы
+    modifier ensure(uint deadline) {
+        require(deadline >= block.timestamp, "Transaction expired");
+        _;
+    }
+
+    modifier tradingActive() {
+        require(!tradingPaused, "Trading is paused");
+        _;
+    }
+
+    modifier notInEmergencyState() {
+        require(!emergencyPause, "Contract is in emergency state");
+        _;
+    }
+
+    modifier nonReentrant() {
+        require(reentrancyStatus == ReentrancyStatus.NotEntered, "Re-entrant call");
+        reentrancyStatus = ReentrancyStatus.Entered;
+        _;
+        reentrancyStatus = ReentrancyStatus.NotEntered;
+    }
+
+    modifier validToken(address token) {
+        require(token != address(0), "Invalid token address");
+        require(IERC20Extended(token).totalSupply() > 0, "Not a valid ERC20 token");
+        require(IERC20Extended(token).balanceOf(address(this)) > 0, "Token must exist in the contract");
+        _;
+    }
+
+    // Конструктор с параметрами инициализации
+    constructor(
+        address _router,
+        uint256 _maxTradeAmount,
+        uint256 _minTradeAmount,
+        uint256 _gasLimit,
+        string memory _version,
+        string memory _description
+    ) {
+        _setupRole(DEFAULT_ADMIN_ROLE, msg.sender);
+        router = IUniswapV2Router02(_router);
+        maxTradeAmount = _maxTradeAmount;
+        minTradeAmount = _minTradeAmount;
+        gasLimit = _gasLimit;
+        lastAuditTime = block.timestamp;
+        auditPassed = true;
+        reentrancyStatus = ReentrancyStatus.NotEntered;
+        emergencyPause = false;
+
+        // Устанавливаем метаданные
+        contractVersion = _version;
+        contractDescription = _description;
+    }
+
+    // Функция для проверки текущего статуса контракта
+    function checkContractStatus() external view returns (uint256, uint256, bool, bool, bool) {
+        return (maxTradeAmount, minTradeAmount, tradingPaused, auditPassed, emergencyPause);
+    }
+
+    // Функция для проведения аудита контракта
+    function auditContract() external onlyRole(ADMIN_ROLE) { 
+        bool check = (gasLimit > 0 && maxTradeAmount > minTradeAmount);
+        auditPassed = check; 
+        lastAuditTime = block.timestamp; 
+        emit SecurityCheckPassed(check); 
+        emit AuditStatusUpdated(check); 
+    }
+
+    // Функция для управления лимитами торговли
+    function setTradeLimits(uint256 _maxTradeAmount, uint256 _minTradeAmount) external onlyRole(ADMIN_ROLE) {
+        maxTradeAmount = _maxTradeAmount;
+        minTradeAmount = _minTradeAmount;
+    }
+
+    // Общая проверка для amount
+    function validateAmount(uint256 amountIn) internal view {
+        require(amountIn > 0, "Amount must be greater than 0");
+        require(amountIn >= minTradeAmount, "Amount is below minimum limit");
+        require(amountIn <= maxTradeAmount, "Amount exceeds maximum limit");
+    }
+
+    // Функция для выполнения арбитражных операций
+    function executeArbitrage(
+        address[] calldata path,
+        uint256 amountIn,
+        uint256 minAmountOut,
+        uint deadline
+    ) external onlyRole(ADMIN_ROLE) ensure(deadline) tradingActive notInEmergencyState nonReentrant {
+        validateAmount(amountIn);
+        require(IERC20Extended(path[0]).balanceOf(address(this)) >= amountIn, "Insufficient balance for trade"); 
+        require(!IERC20Extended(path[0]).isFrozen(address(this)), "Token is frozen");
+
+        uint256 gasStart = gasleft();
+
+        uint256[] memory amounts = getAmountsOut(amountIn, path);
+        require(amounts[amounts.length - 1] >= minAmountOut, "Received amount is less than expected");
+
+        IERC20Extended(path[0]).safeTransferFrom(msg.sender, address(this), amountIn); 
+        IERC20Extended(path[0]).safeApprove(address(router), amountIn); 
+
+        uint256[] memory swapAmounts = router.swapExactTokensForTokens(
+            amountIn,
+            amounts[amounts.length - 1],
+            path,
+            address(this),
+            deadline
+        );
+
+        uint256 profit = swapAmounts[swapAmounts.length - 1];
+        require(profit >= minAmountOut, "Profit is less than minimum"); 
+
+        IERC20Extended(path[path.length - 1]).safeTransfer(msg.sender, profit);
+
+        uint256 gasUsed = gasStart - gasleft(); 
+        require(gasUsed <= gasLimit, "Gas usage exceeds limit"); 
+        uint256 gasCost = gasUsed * tx.gasprice; 
+
+        emit ArbitrageExecuted(path[0], path[path.length - 1], amountIn, profit, msg.sender); 
+        emit GasCostCalculated(gasUsed, gasCost); 
+        emit TradeLogged(path[0], path[path.length - 1], amountIn, profit); 
+    }
+
+    // Функция для получения ожидаемых количеств токенов
+    function getAmountsOut(uint256 amountIn, address[] memory path) internal view returns (uint256[] memory) {
+        return router.getAmountsOut(amountIn, path);
+    }
+
+    // Функция для сканирования ликвидности пулов
+    function scanLiquidityPools(address[] memory pools) external onlyRole(ADMIN_ROLE) {
+        require(pools.length <= 100, "Too many pools to scan"); // Ограничение на максимальное количество для сканирования
+        for (uint256 i = 0; i < pools.length; i++) {
+            ILiquidityPool pool = ILiquidityPool(pools[i]);
+            (uint112 reserve0, uint112 reserve1) = pool.getReserves(); 
+            emit LiquidityInfo(pools[i], reserve0, reserve1); 
+        }
+    }
+
+    // Функция для активации аварийной паузы
+    function activateEmergencyPause() external onlyRole(ADMIN_ROLE) {        
+        emergencyPause = true; 
+        lastEmergencyPauseTime = block.timestamp; 
+        emit EmergencyPauseActivated(); 
+    }
+
+    // Функция для обновления адреса роутера
+    function updateRouter(address _router) external onlyRole(ADMIN_ROLE) {        
+        router = IUniswapV2Router02(_router);        
+        emit RouterUpdated(_router); 
+    }
+
+    // Функция для переключения состояния торговли
+    function toggleTradingPause() external onlyRole(ADMIN_ROLE) {        
+        tradingPaused = !tradingPaused; 
+        emit TradingStatusUpdated(tradingPaused); 
+    }
+
+    // Функция для обновления метаданных
+    function updateMetadata(string memory newVersion, string memory newDescription) external onlyRole(ADMIN_ROLE) {        
+        contractVersion = newVersion; 
+        contractDescription = newDescription; 
+        emit MetadataUpdated(newVersion, newDescription); 
+    }
+
+    // Функция для аварийного вывода токенов
+    function emergencyWithdrawal(address token, uint256 amount) external onlyRole(ADMIN_ROLE) validToken(token) {        
+        require(amount > 0, "Amount must be greater than 0"); 
+        require(IERC20Extended(token).balanceOf(address(this)) >= amount, "Insufficient contract balance"); 
+        IERC20Extended(token).safeTransfer(msg.sender, amount); 
+        emit EmergencyWithdrawal(token, amount, msg.sender); 
+    }
+
+    // Функция вывода токенов администратором
+    function withdrawTokens(address token, uint256 amount) external onlyRole(ADMIN_ROLE) validToken(token) {        
+        require(amount > 0, "Amount must be greater than 0"); 
+        require(IERC20Extended(token).balanceOf(address(this)) >= amount, "Insufficient contract balance"); 
+        IERC20Extended(token).safeTransfer(msg.sender, amount); 
+        emit Withdrawal(token, amount, msg.sender); 
+    }
+}
